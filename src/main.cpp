@@ -19,6 +19,7 @@
 #define TEMP_SETPOINT_MAX   21.0f   // highest allowed setpoint (°C)
 #define TEMP_HYSTERESIS      1.0f   // heater on/off band (°C)
 #define TEMP_INVALID       -100.0f  // threshold below which a reading is bad
+#define TEMP_INVALID_POWERUP 85.0f   // threshold for invalid reading after power-up or bad connection (°C) – DS18B20 returns 85°C on power-up
 
 // ─── Timing constants (ms) ──────────────────────────────────────────────────
 #define SENSOR_REQUEST_INTERVAL_MS    1000
@@ -45,7 +46,7 @@ static float dataT1 = 0.0f;
 static float dataT2 = 0.0f;
 static float dataT3 = 0.0f;
 static bool  criticalError = false;
-// FIX #5: flag so wifiTask waits for at least one real sensor read before sending
+
 static bool  sensorReady = false;
 
 SemaphoreHandle_t dataMutex;   // guards dataT1/T2/T3, criticalError, sensorReady
@@ -87,12 +88,10 @@ void setup()
   float t2 = sensors.getTempC(term_2);
   float t3 = sensors.getTempC(term_3);
 
-  // FIX #6: validate ALL three sensor readings at startup, not just sensor 1.
-  //         Sensors 2 & 3 were unconditionally stored, so a bad reading of -127°C
-  //         would seed the EMA with a wildly wrong value.
-  dataT1 = (t1 > TEMP_INVALID) ? t1 : 20.0f;
-  dataT2 = (t2 > TEMP_INVALID) ? t2 : 20.0f;
-  dataT3 = (t3 > TEMP_INVALID) ? t3 : 20.0f;
+  //readings with validation 
+  dataT1 = (t1 > TEMP_INVALID && t1 < TEMP_INVALID_POWERUP) ? t1 : 20.0f;
+  dataT2 = (t2 > TEMP_INVALID && t2 < TEMP_INVALID_POWERUP) ? t2 : 20.0f;
+  dataT3 = (t3 > TEMP_INVALID && t3 < TEMP_INVALID_POWERUP) ? t3 : 20.0f;
 
   // ── Pins ─────────────────────────────────────────────────────────────────
   pinMode(PIN_WARMER, OUTPUT);
@@ -119,10 +118,10 @@ void setup()
 
   // ── Spawn tasks ──────────────────────────────────────────────────────────
   // sensorTask: core 0, stack 4 KB  – only does DS18B20 I/O and math
-  // wifiTask  : core 0, stack 16 KB – HTTPClient + JSON need the headroom
+  // wifiTask  : core 0, stack 20 KB – HTTPClient + JSON need the headroom
   // loop()    : core 1 (Arduino default) – lightweight timer-driven heater logic
   xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096,  NULL, 5, &hSensorTask, 0);
-  xTaskCreatePinnedToCore(wifiTask,   "wifiTask",   16384, NULL, 4, &hWifiTask,   0);
+  xTaskCreatePinnedToCore(wifiTask,   "wifiTask",   20480, NULL, 4, &hWifiTask,   0);
 
   Serial.print("setup() running on core ");
   Serial.println(xPortGetCoreID());
@@ -272,27 +271,16 @@ void sensorTask(void *parameter)
     float t3 = sensors.getTempC(term_3);
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      // ── Sensor 1: controls heating – treat bad readings as a critical error
-      // FIX #2/#3: use a consistent comparison idiom for all sensors.
-      //   Bad DS18B20 reading = -127°C. TEMP_INVALID = -100°C.
-      //   Valid: t > TEMP_INVALID  (e.g. 21.0 > -100 → true)
-      //   Bad:   t < TEMP_INVALID  (e.g. -127 < -100 → true)
-      //   The original sensor-1 check (t1 < TEMP_INVALID) was correct.
-      //   The original sensor-2/3 checks (t > TEMP_INVALID) were also accidentally
-      //   correct but used the opposite operator, making the intent ambiguous.
-      //   Unified here to use (t > TEMP_INVALID) for "reading is valid".
-      if (t1 >= 70 || t1 <= TEMP_INVALID) {
+      if (t1 >= TEMP_INVALID_POWERUP || t1 <= TEMP_INVALID) {
         criticalError = true;
       } else {
         criticalError = false;
         dataT1 = dataT1 * (1.0f - ALPHA) + t1 * ALPHA;
       }
 
-      // ── Sensors 2 & 3: informational – skip bad readings rather than corrupt EMA
       if (t2 > TEMP_INVALID) dataT2 = dataT2 * (1.0f - ALPHA) + t2 * ALPHA;
       if (t3 > TEMP_INVALID) dataT3 = dataT3 * (1.0f - ALPHA) + t3 * ALPHA;
 
-      // FIX #5: mark that at least one real sensor cycle has completed
       sensorReady = true;
 
       xSemaphoreGive(dataMutex);
@@ -321,8 +309,6 @@ void wifiTask(void *parameter)
         continue;
       }
 
-      // FIX #5: don't send until sensorTask has completed at least one full cycle,
-      //         otherwise we'd transmit stale setup() values or uninitialised data.
       if (!ready) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_REQUEST_INTERVAL_MS * 2));
         continue;
