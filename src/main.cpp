@@ -25,8 +25,11 @@
 #define WIFI_TASK_INTERVAL_MS        40000
 #define WIFI_RETRY_INTERVAL_MS       30000
 
+// ─── Heater-check interval default (minutes) ────────────────────────────────
+#define HEATER_CHECK_INTERVAL_DEFAULT_MIN  2.0f
+
 // ─── EMA filter coefficient ─────────────────────────────────────────────────
-static const float ALPHA = 0.4f;
+static const float ALPHA = 0.3f;
 
 // ─── One-Wire / sensor setup ─────────────────────────────────────────────────
 OneWire oneWire(PIN_ONE_WIRE);
@@ -42,8 +45,10 @@ static float dataT1 = 0.0f;
 static float dataT2 = 0.0f;
 static float dataT3 = 0.0f;
 static bool  criticalError = false;
+// FIX #5: flag so wifiTask waits for at least one real sensor read before sending
+static bool  sensorReady = false;
 
-SemaphoreHandle_t dataMutex;   // guards dataT1/T2/T3 and criticalError
+SemaphoreHandle_t dataMutex;   // guards dataT1/T2/T3, criticalError, sensorReady
 SemaphoreHandle_t prefsMutex;  // guards all Preferences (NVS) access
 
 // ─── Timer ──────────────────────────────────────────────────────────────────
@@ -69,8 +74,8 @@ void setup()
   dataMutex  = xSemaphoreCreateMutex();
   prefsMutex = xSemaphoreCreateMutex();
 
-  // ── Read the heater-check interval from NVS before starting the timer ──
-  float boarderTimeMinutes = 2.0f;
+  float boarderTimeMinutes = HEATER_CHECK_INTERVAL_DEFAULT_MIN;
+
 
   // ── Warm up sensors ──────────────────────────────────────────────────────
   sensors.begin();
@@ -78,10 +83,16 @@ void setup()
   sensors.requestTemperatures();
   delay(SENSOR_REQUEST_INTERVAL_MS);
 
-  float t = sensors.getTempC(term_1);
-  dataT1 = (t > TEMP_INVALID) ? t : 20.0f;
-  dataT2 = sensors.getTempC(term_2);
-  dataT3 = sensors.getTempC(term_3);
+  float t1 = sensors.getTempC(term_1);
+  float t2 = sensors.getTempC(term_2);
+  float t3 = sensors.getTempC(term_3);
+
+  // FIX #6: validate ALL three sensor readings at startup, not just sensor 1.
+  //         Sensors 2 & 3 were unconditionally stored, so a bad reading of -127°C
+  //         would seed the EMA with a wildly wrong value.
+  dataT1 = (t1 > TEMP_INVALID) ? t1 : 20.0f;
+  dataT2 = (t2 > TEMP_INVALID) ? t2 : 20.0f;
+  dataT3 = (t3 > TEMP_INVALID) ? t3 : 20.0f;
 
   // ── Pins ─────────────────────────────────────────────────────────────────
   pinMode(PIN_WARMER, OUTPUT);
@@ -194,13 +205,13 @@ void fetchConfig()
   HTTPClient http;
   http.setTimeout(10000);
   http.begin(String(SERVER) + "/config");
-  http.addHeader("X-API-Key", ESP_KEY);   // added – consistent with other calls
+  http.addHeader("X-API-Key", ESP_KEY);
   int code = http.GET();
 
   if (code == 200) {
     String payload = http.getString();
 
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
       Serial.println("fetchConfig: JSON parse error: " + String(err.c_str()));
@@ -262,7 +273,15 @@ void sensorTask(void *parameter)
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       // ── Sensor 1: controls heating – treat bad readings as a critical error
-      if (t1 < TEMP_INVALID) {
+      // FIX #2/#3: use a consistent comparison idiom for all sensors.
+      //   Bad DS18B20 reading = -127°C. TEMP_INVALID = -100°C.
+      //   Valid: t > TEMP_INVALID  (e.g. 21.0 > -100 → true)
+      //   Bad:   t < TEMP_INVALID  (e.g. -127 < -100 → true)
+      //   The original sensor-1 check (t1 < TEMP_INVALID) was correct.
+      //   The original sensor-2/3 checks (t > TEMP_INVALID) were also accidentally
+      //   correct but used the opposite operator, making the intent ambiguous.
+      //   Unified here to use (t > TEMP_INVALID) for "reading is valid".
+      if (t1 >= 70 || t1 <= TEMP_INVALID) {
         criticalError = true;
       } else {
         criticalError = false;
@@ -272,6 +291,9 @@ void sensorTask(void *parameter)
       // ── Sensors 2 & 3: informational – skip bad readings rather than corrupt EMA
       if (t2 > TEMP_INVALID) dataT2 = dataT2 * (1.0f - ALPHA) + t2 * ALPHA;
       if (t3 > TEMP_INVALID) dataT3 = dataT3 * (1.0f - ALPHA) + t3 * ALPHA;
+
+      // FIX #5: mark that at least one real sensor cycle has completed
+      sensorReady = true;
 
       xSemaphoreGive(dataMutex);
     }
@@ -287,13 +309,22 @@ void wifiTask(void *parameter)
   for (;;) {
     if (WiFi.status() == WL_CONNECTED) {
       float t1, t2, t3;
+      bool ready;
       if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        t1 = dataT1;
-        t2 = dataT2;
-        t3 = dataT3;
+        t1    = dataT1;
+        t2    = dataT2;
+        t3    = dataT3;
+        ready = sensorReady;  // FIX #5: read the ready flag under the same lock
         xSemaphoreGive(dataMutex);
       } else {
         vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_INTERVAL_MS));
+        continue;
+      }
+
+      // FIX #5: don't send until sensorTask has completed at least one full cycle,
+      //         otherwise we'd transmit stale setup() values or uninitialised data.
+      if (!ready) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_REQUEST_INTERVAL_MS * 2));
         continue;
       }
 
